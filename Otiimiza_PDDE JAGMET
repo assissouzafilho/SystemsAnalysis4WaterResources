@@ -1,0 +1,92 @@
+# import Pkg; Pkg.add("Distributions")
+
+using JuMP, HiGHS, Random, Distributions
+
+# Definição do tempo de simulação e cenários
+T = 12  # Horizonte de 12 meses
+S = 5   # Número de cenários estocásticos
+
+# Probabilidades associadas aos cenários
+p_s = fill(1 / S, S)
+
+# Geração de cenários de vazão afluente (normal para incerteza)
+Random.seed!(42)
+Qafluente1_scenarios = [rand(Normal(50, 15), T) for _ in 1:S]
+Qafluente2_scenarios = [rand(Normal(20, 8), T) for _ in 1:S]
+Qafluente3_scenarios = [rand(Normal(15, 6), T) for _ in 1:S]
+
+# Demanda e evaporação determinísticas
+D1 = [40 + 5 * sin(2π * t / 12) for t in 1:T]
+D2 = [30 + 4 * sin(2π * t / 12) for t in 1:T]
+D3 = [25 + 3 * sin(2π * t / 12) for t in 1:T]
+D4 = [35 + 6 * sin(2π * t / 12) for t in 1:T]
+
+k_evap = 0.002  # Coeficiente de evaporação
+
+# Capacidade dos reservatórios
+Vmax1, Vmax2, Vmax3 = 1000.0, 800.0, 600.0
+Vmin1, Vmin2, Vmin3 = 200.0, 150.0, 100.0
+V0_1, V0_2, V0_3 = 500.0, 400.0, 300.0
+
+# Vazão máxima permitida
+Qmax1, Qmax2, Qmax3 = 100.0, 80.0, 70.0
+
+# Passo de tempo (hm³/mês)
+Δt = 30.0 * 24.0 * 3600.0 / 1e6
+
+# Modelo de otimização
+modelo = Model(HiGHS.Optimizer)
+
+# Definição das variáveis com limites
+@variable(modelo, Vmin1 <= V1[1:T, 1:S] <= Vmax1)
+@variable(modelo, Vmin2 <= V2[1:T, 1:S] <= Vmax2)
+@variable(modelo, Vmin3 <= V3[1:T, 1:S] <= Vmax3)
+
+# Variáveis de controle e vertimento
+@variable(modelo, 0 <= Qcontrol1[1:T, 1:S] <= Qmax1)
+@variable(modelo, 0 <= Qcontrol2[1:T, 1:S] <= Qmax2)
+@variable(modelo, 0 <= Qcontrol3[1:T, 1:S] <= Qmax3)
+@variable(modelo, 0 <= Qvert1[1:T, 1:S] <= Qmax1)
+@variable(modelo, 0 <= Qvert2[1:T, 1:S] <= Qmax2)
+@variable(modelo, 0 <= Qvert3[1:T, 1:S] <= Qmax3)
+@variable(modelo, 0 <= QD4_2[1:T, 1:S] <= Qmax2)
+@variable(modelo, 0 <= QD4_3[1:T, 1:S] <= Qmax3)
+
+# Erros de atendimento da demanda
+@variable(modelo, z1[1:T, 1:S] >= 0)
+@variable(modelo, z2[1:T, 1:S] >= 0)
+@variable(modelo, z3[1:T, 1:S] >= 0)
+@variable(modelo, z4[1:T, 1:S] >= 0)
+
+# Restrições iniciais para todos os cenários
+@constraint(modelo, [s = 1:S], V1[1, s] == V0_1)
+@constraint(modelo, [s = 1:S], V2[1, s] == V0_2)
+@constraint(modelo, [s = 1:S], V3[1, s] == V0_3)
+
+# Restrições de balanço hídrico vetorizadas
+@constraint(modelo, [t = 1:T-1, s = 1:S],
+    V1[t+1, s] == V1[t, s] + (Qafluente1_scenarios[s][t] - Qcontrol1[t, s] - Qvert1[t, s] - k_evap * V1[t, s]) * Δt)
+
+@constraint(modelo, [t = 1:T-1, s = 1:S],
+    V2[t+1, s] == V2[t, s] + (Qafluente2_scenarios[s][t] + Qvert1[t, s] - Qcontrol2[t, s] - QD4_2[t, s] - Qvert2[t, s] - k_evap * V2[t, s]) * Δt)
+
+@constraint(modelo, [t = 1:T-1, s = 1:S],
+    V3[t+1, s] == V3[t, s] + (Qafluente3_scenarios[s][t] - Qcontrol3[t, s] - QD4_3[t, s] - Qvert3[t, s] - k_evap * V3[t, s]) * Δt)
+
+# Restrições de atendimento da demanda corrigidas
+@constraint(modelo, [t = 1:T, s = 1:S], Qcontrol1[t, s] + z1[t, s] >= D1[t])
+@constraint(modelo, [t = 1:T, s = 1:S], Qcontrol2[t, s] + z2[t, s] >= D2[t])
+@constraint(modelo, [t = 1:T, s = 1:S], Qcontrol3[t, s] + z3[t, s] >= D3[t])
+@constraint(modelo, [t = 1:T, s = 1:S], QD4_2[t, s] + QD4_3[t, s] + z4[t, s] >= D4[t])
+
+# Função objetivo: Custo esperado considerando a probabilidade dos cenários
+@objective(modelo, Min, sum(p_s[s] * sum(10 * (z1[t, s] + z2[t, s] + z3[t, s] + z4[t, s]) +
+                                          5 * (Qvert1[t, s] + Qvert2[t, s] + Qvert3[t, s]) for t in 1:T) for s in 1:S))
+
+# Resolver o modelo
+optimize!(modelo)
+
+# Resultados para o primeiro cenário
+println("Volume ótimo do reservatório 1 (cenário 1): ", value.(V1[:, 1]))
+println("Volume ótimo do reservatório 2 (cenário 1): ", value.(V2[:, 1]))
+println("Volume ótimo do reservatório 3 (cenário 1): ", value.(V3[:, 1]))

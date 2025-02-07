@@ -1,0 +1,96 @@
+# import Pkg; Pkg.add("Ipopt")
+
+using JuMP, Ipopt, Random, Plots
+
+# Definição do tempo de simulação
+T = 12  # Horizonte de 12 meses
+
+# Coeficientes da relação área-volume para cada reservatório (A_i(V) = a_i V³ + b_i V² + c_i V + d_i)
+a1, b1, c1, d1 = 1e-6, -0.001, 0.1, 1.0
+a2, b2, c2, d2 = 1.2e-6, -0.0009, 0.09, 0.9
+a3, b3, c3, d3 = 1.1e-6, -0.0011, 0.095, 0.95
+
+# Coeficientes de evaporação variando por mês e reservatório
+kevap1 = [0.002 + 0.0001 * sin(2π * t / 12) for t in 1:T]
+kevap2 = [0.0022 + 0.00012 * sin(2π * t / 12) for t in 1:T]
+kevap3 = [0.0018 + 0.00008 * sin(2π * t / 12) for t in 1:T]
+
+# Capacidade dos reservatórios
+Vmax1, Vmax2, Vmax3 = 1000.0, 800.0, 600.0
+Vmin1, Vmin2, Vmin3 = 200.0, 150.0, 100.0
+
+# Vazão máxima permitida nos reservatórios
+Qmax1, Qmax2, Qmax3 = 100.0, 80.0, 70.0
+
+# Inicialização dos volumes dos reservatórios
+V0_1, V0_2, V0_3 = 500.0, 400.0, 300.0
+
+# Geração de séries sintéticas de vazão afluente e demanda sazonal
+Random.seed!(42)
+Qafluente1 = [50 + 20 * sin(2π * t / 12) + 10 * randn() for t in 1:T]
+Qafluente2 = [20 + 10 * sin(2π * t / 12) + 5 * randn() for t in 1:T]
+Qafluente3 = [15 + 8 * sin(2π * t / 12) + 4 * randn() for t in 1:T]
+
+D1 = [40 + 5 * sin(2π * t / 12) for t in 1:T]
+D2 = [30 + 4 * sin(2π * t / 12) for t in 1:T]
+D3 = [25 + 3 * sin(2π * t / 12) for t in 1:T]
+D4 = [35 + 6 * sin(2π * t / 12) for t in 1:T]  # Demanda compartilhada entre R2 e R3
+
+# Definição do passo de tempo (conversão para hm³/mês)
+Δt = 30.0 * 24.0 * 3600.0 / 1e6  # Conversão para hm³/mês
+
+# Criação do modelo de otimização
+modelo = Model(Ipopt.Optimizer)
+
+# Variáveis de volume nos reservatórios
+@variable(modelo, Vmin1 <= V1[1:T] <= Vmax1)
+@variable(modelo, Vmin2 <= V2[1:T] <= Vmax2)
+@variable(modelo, Vmin3 <= V3[1:T] <= Vmax3)
+
+# Variáveis de controle e vertimento
+@variable(modelo, 0 <= Qcontrol1[1:T] <= Qmax1)
+@variable(modelo, 0 <= Qcontrol2[1:T] <= Qmax2)
+@variable(modelo, 0 <= Qcontrol3[1:T] <= Qmax3)
+@variable(modelo, 0 <= Qvert1[1:T] <= Qmax1)
+@variable(modelo, 0 <= Qvert2[1:T] <= Qmax2)
+@variable(modelo, 0 <= Qvert3[1:T] <= Qmax3)
+@variable(modelo, 0 <= QD4_2[1:T] <= Qmax2)  # R2 pode abastecer D4
+@variable(modelo, 0 <= QD4_3[1:T] <= Qmax3)  # R3 pode abastecer D4
+
+# Erros de atendimento das demandas
+@variable(modelo, z1[1:T] >= 0)
+@variable(modelo, z2[1:T] >= 0)
+@variable(modelo, z3[1:T] >= 0)
+@variable(modelo, z4[1:T] >= 0)
+
+# Restrições de balanço hídrico
+@constraint(modelo, V1[1] == V0_1)
+@constraint(modelo, V2[1] == V0_2)
+@constraint(modelo, V3[1] == V0_3)
+
+@NLconstraint(modelo, [t = 1:T-1],
+    V1[t+1] == V1[t] + (Qafluente1[t] - Qcontrol1[t] - Qvert1[t] - kevap1[t] * (a1 * V1[t]^3 + b1 * V1[t]^2 + c1 * V1[t] + d1)) * Δt)
+
+@NLconstraint(modelo, [t = 1:T-1],
+    V2[t+1] == V2[t] + (Qafluente2[t] + Qvert1[t] - Qcontrol2[t] - QD4_2[t] - Qvert2[t] - kevap2[t] * (a2 * V2[t]^3 + b2 * V2[t]^2 + c2 * V2[t] + d2)) * Δt)
+
+@NLconstraint(modelo, [t = 1:T-1],
+    V3[t+1] == V3[t] + (Qafluente3[t] - Qcontrol3[t] - QD4_3[t] - Qvert3[t] - kevap3[t] * (a3 * V3[t]^3 + b3 * V3[t]^2 + c3 * V3[t] + d3)) * Δt)
+
+# Restrição para atendimento das demandas
+@constraint(modelo, [t = 1:T], Qcontrol1[t] + z1[t] >= D1[t])
+@constraint(modelo, [t = 1:T], Qcontrol2[t] + z2[t] >= D2[t])
+@constraint(modelo, [t = 1:T], Qcontrol3[t] + z3[t] >= D3[t])
+@constraint(modelo, [t = 1:T], QD4_2[t] + QD4_3[t] + z4[t] >= D4[t])
+
+# Função Objetivo: Minimizar falhas no atendimento e vertimentos
+@objective(modelo, Min, sum(10 * (z1[t]^2 + z2[t]^2 + z3[t]^2 + z4[t]^2) +
+                            5 * (Qvert1[t]^2 + Qvert2[t]^2 + Qvert3[t]^2) for t in 1:T))
+
+# Resolver o modelo
+optimize!(modelo)
+
+# Exibir solução ótima
+println("Volume ótimo do reservatório 1: ", value.(V1))
+println("Volume ótimo do reservatório 2: ", value.(V2))
+println("Volume ótimo do reservatório 3: ", value.(V3))
